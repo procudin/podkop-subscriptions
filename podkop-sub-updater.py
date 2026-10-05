@@ -24,6 +24,7 @@ LINK_OPTIONS = (
     'option connection_type',
     'option proxy_config_type',
 )
+CONFIG_RE = re.compile(r"^\s*config\s+\S+\s+['\"]?([a-zA-Z0-9_-]+)")
 
 def setup_syslog():
     syslog.openlog("podkop-updater", syslog.LOG_PID, syslog.LOG_USER)
@@ -130,9 +131,17 @@ def load_jobs(subs_path):
                 log("WARN", f"Строка {line_num}: недопустимое действие '{on_empty}'. Разрешены: {', '.join(VALID_ON_EMPTY)}. Пропуск.")
                 continue
 
+            regex = None
+            if regex_pattern:
+                try:
+                    regex = re.compile(regex_pattern, re.IGNORECASE)
+                except re.error as e:
+                    log("WARN", f"Строка {line_num}: некорректное регулярное выражение '{regex_pattern}' ({e}). Пропуск.")
+                    continue
+
             jobs[sec_name] = {
                 'url': url,
-                'regex': regex_pattern,
+                'regex': regex,
                 'match_mode': match_mode,
                 'ptype': ptype,
                 'on_empty': on_empty,
@@ -190,14 +199,10 @@ def fetch_links(jobs, hwid, device_model, kernel_ver):
                     raw_tag = ln.split('#', 1)[1] if '#' in ln else ln
                     tag = unquote(raw_tag)
 
-                    try:
-                        is_match = bool(re.search(job['regex'], tag, re.IGNORECASE))
-                        if (job['match_mode'] == 'ifmatch' and is_match) or \
-                           (job['match_mode'] == 'ifnotmatch' and not is_match):
-                            filtered_links.append(ln)
-                    except re.error:
-                        log("ERROR", f"[{sec}]: Некорректное регулярное выражение '{job['regex']}'")
-                        break
+                    is_match = bool(job['regex'].search(tag))
+                    if (job['match_mode'] == 'ifmatch' and is_match) or \
+                       (job['match_mode'] == 'ifnotmatch' and not is_match):
+                        filtered_links.append(ln)
                 else:
                     filtered_links.append(ln)
 
@@ -230,49 +235,48 @@ def update_uci_config(config_path, jobs):
     found_sections = set()
     skip_multiline = False
 
-    def flush_section(sec_name):
-        sec_name_lower = sec_name.lower()
-        if sec_name_lower in jobs and jobs[sec_name_lower]['links']:
-            ptype = jobs[sec_name_lower]['ptype']
+    def flush_section(sec):
+        if sec in jobs:
+            ptype = jobs[sec]['ptype']
             out_lines.append(f"\toption connection_type 'proxy'\n")
             out_lines.append(f"\toption proxy_config_type '{ptype}'\n")
-            for link in jobs[sec_name_lower]['links']:
+            for link in jobs[sec]['links']:
+                link = link.replace("'", "'\\''") # экранирование кавычки в UCI
                 out_lines.append(f"\tlist {ptype}_proxy_links '{link}'\n")
 
     for line in old_lines:
-        m = re.match(r"^\s*config\s+([a-zA-Z0-9_-]+)\s+['\"]?([a-zA-Z0-9_-]+)['\"]?", line, re.IGNORECASE)
+        m = CONFIG_RE.match(line)
         if m:
-            if current_sec:
-                flush_section(current_sec)
-            
-            current_sec = m.group(2)
-            if current_sec.lower() in jobs:
-                found_sections.add(current_sec.lower())
-                
+            flush_section(current_sec)
+
+            current_sec = m.group(1).lower()
+            if current_sec in jobs:
+                found_sections.add(current_sec)
+
             out_lines.append(line)
             skip_multiline = False
             continue
-        
-        if current_sec and current_sec.lower() in jobs and jobs[current_sec.lower()]['links']:
+
+        if current_sec in jobs:
             sline = line.strip()
-            
+            quotes = sline.replace("\\'", "").count("'") # без учета экранированных кавычек
+
             if skip_multiline:
-                if "'" in sline:
+                if quotes % 2 != 0:
                     skip_multiline = False
                 continue
 
             if sline.startswith(LINK_OPTIONS + ('option proxy_string',)):
-                if line.count("'") % 2 != 0:
+                if quotes % 2 != 0:
                     skip_multiline = True
-                continue 
-        
+                continue
+
         out_lines.append(line)
 
-    if current_sec:
-        flush_section(current_sec)
+    flush_section(current_sec)
 
     for sec in jobs:
-        if jobs[sec]['links'] and sec not in found_sections:
+        if sec not in found_sections:
             log("WARN", f"Секция '{sec}' успешно скачана, но отсутствует в {config_path} (ожидается config proxy '{sec}')")
 
     new_content = "".join(out_lines)
@@ -285,17 +289,32 @@ def links_state(text, jobs):
     state = set()
     sec = None
     for line in text.splitlines():
-        m = re.match(r"^\s*config\s+\S+\s+['\"]?([a-zA-Z0-9_-]+)", line)
+        m = CONFIG_RE.match(line)
         if m:
             sec = m.group(1).lower()
             continue
 
         line = line.strip()
-        if sec in jobs and jobs[sec]['links'] and line.startswith(LINK_OPTIONS):
+        if sec in jobs and line.startswith(LINK_OPTIONS):
             line = re.sub(r'sid=[a-zA-Z0-9]+', '', line) # ignore dynamic sid
             line = re.sub(r"#[^']*", '', line)          # ignore link comments
             state.add((sec, line))
     return state
+
+def write_config(path, content):
+    """Атомарная запись: сначала во временный файл, затем подмена оригинала"""
+    tmp = os.path.join(os.path.dirname(path), f".{os.path.basename(path)}.tmp")
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, os.stat(path).st_mode & 0o777)
+        os.replace(tmp, path)
+    except Exception:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
 
 def main():
     setup_syslog()
@@ -317,9 +336,10 @@ def main():
         sys.exit(1)
 
     fetch_links(jobs, hwid, device_model, kernel_ver)
+    active_jobs = {sec: job for sec, job in jobs.items() if job['links']}
 
-    old_content, new_content = update_uci_config(args.config, jobs)
-    is_content_changed = links_state(old_content, jobs) != links_state(new_content, jobs)
+    old_content, new_content = update_uci_config(args.config, active_jobs)
+    is_content_changed = links_state(old_content, active_jobs) != links_state(new_content, active_jobs)
 
     # Проверяем изменения, но учитываем флаг --force
     if not args.force and not is_content_changed:
@@ -331,12 +351,13 @@ def main():
             log("INFO", "Применение обновлений и перезапуск Podkop...")
 
         try:
-            with open(args.config, 'w', encoding='utf-8') as f:
-                f.write(new_content)
-            os.system("/etc/init.d/podkop restart")
-            log("INFO", "Успешно завершено.")
+            write_config(args.config, new_content)
         except Exception as e:
             log("ERROR", f"Ошибка при сохранении конфига: {e}")
+            sys.exit(1)
+
+        os.system("/etc/init.d/podkop restart")
+        log("INFO", "Успешно завершено.")
 
 if __name__ == "__main__":
     main()
