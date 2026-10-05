@@ -18,6 +18,12 @@ VALID_PROTOCOLS = ('vless://', 'vmess://', 'trojan://', 'ss://', 'ssr://', 'hy2:
 VALID_PTYPES = {'urltest', 'selector'}
 VALID_ON_EMPTY = {'all', 'skip'}
 VALID_MATCH_MODES = {'ifmatch', 'ifnotmatch'}
+LINK_OPTIONS = (
+    'list urltest_proxy_links',
+    'list selector_proxy_links',
+    'option connection_type',
+    'option proxy_config_type',
+)
 
 def setup_syslog():
     syslog.openlog("podkop-updater", syslog.LOG_PID, syslog.LOG_USER)
@@ -255,13 +261,7 @@ def update_uci_config(config_path, jobs):
                     skip_multiline = False
                 continue
 
-            if any(sline.startswith(prefix) for prefix in (
-                'list urltest_proxy_links',
-                'list selector_proxy_links',
-                'option connection_type',
-                'option proxy_config_type',
-                'option proxy_string'
-            )):
+            if sline.startswith(LINK_OPTIONS + ('option proxy_string',)):
                 if line.count("'") % 2 != 0:
                     skip_multiline = True
                 continue 
@@ -280,10 +280,22 @@ def update_uci_config(config_path, jobs):
 
     return old_content, new_content
 
-def normalize_config(text):
-    text = re.sub(r'sid=[a-zA-Z0-9]+', '', text) # ignore dynamic sid
-    text = re.sub(r'#[^\'\n\r]*', '', text)      # ignore link comments
-    return text.replace('\n', '').replace('\r', '')
+def links_state(text, jobs):
+    """Набор строк со ссылками и их настройками в управляемых секциях (без учета порядка)"""
+    state = set()
+    sec = None
+    for line in text.splitlines():
+        m = re.match(r"^\s*config\s+\S+\s+['\"]?([a-zA-Z0-9_-]+)", line)
+        if m:
+            sec = m.group(1).lower()
+            continue
+
+        line = line.strip()
+        if sec in jobs and jobs[sec]['links'] and line.startswith(LINK_OPTIONS):
+            line = re.sub(r'sid=[a-zA-Z0-9]+', '', line) # ignore dynamic sid
+            line = re.sub(r"#[^']*", '', line)          # ignore link comments
+            state.add((sec, line))
+    return state
 
 def main():
     setup_syslog()
@@ -307,7 +319,7 @@ def main():
     fetch_links(jobs, hwid, device_model, kernel_ver)
 
     old_content, new_content = update_uci_config(args.config, jobs)
-    is_content_changed = normalize_config(old_content) != normalize_config(new_content)
+    is_content_changed = links_state(old_content, jobs) != links_state(new_content, jobs)
 
     # Проверяем изменения, но учитываем флаг --force
     if not args.force and not is_content_changed:
